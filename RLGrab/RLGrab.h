@@ -17,7 +17,6 @@
 
 constexpr auto plugin_version = stringify(VERSION_MAJOR) "." stringify(VERSION_MINOR) "." stringify(VERSION_PATCH) "." stringify(VERSION_BUILD);
 
-
 class RLGrab : public BakkesMod::Plugin::BakkesModPlugin, public BakkesMod::Plugin::PluginSettingsWindow
 {
 public:
@@ -30,18 +29,18 @@ public:
 
 private:
 	// Settings
-	int  pollIntervalMs;    // How often to poll while in match
+	int  pollIntervalMs;    // How often to rescan Launch.log
 	bool logDuplicates;     // If false, only keep unique endpoints
 
 	// State
 	std::atomic<bool> running;
-	std::atomic<bool> inMatch;
-	std::atomic<bool> ipScanDone;  // true once we found > 0 IPs this match
+	std::atomic<bool> inMatch;     // kept for compatibility, not required by log scanning
+	std::atomic<bool> ipScanDone;  // unused by log scanning, kept for compatibility if needed
 
 	std::thread workerThread;
 
 	std::mutex ipsMutex;
-	std::vector<std::string> knownEndpoints; // "ip:port"
+	std::vector<std::string> knownEndpoints; // labels, e.g. "ServerName (ip:port)" or "ip:port"
 	int selectedIndex = -1;
 
 	// BakkesMod helpers
@@ -49,27 +48,21 @@ private:
 	void RegisterNotifiers();
 	void RegisterHooks();
 
-	// Match state
+	// Match state (kept for compatibility)
 	void OnMatchStarted(std::string eventName);
 	void OnMatchEnded(std::string eventName);
 
 	// Worker
 	void WorkerLoop();
-	void QueryAndStoreIPs();
 
-	// Integrated helper functionality
-	struct ConnectionInfo
-	{
-		std::string localAddress;
-		uint16_t    localPort;
-		std::string remoteAddress;
-		uint16_t    remotePort;
-		unsigned long pid;
-	};
-
-	static unsigned long FindRocketLeaguePid();
-	static bool GetAllTcpConnections(std::vector<ConnectionInfo>& outConnections);
-	static std::vector<ConnectionInfo> FilterByPid(const std::vector<ConnectionInfo>& all, unsigned long pid);
+	// Log-based collection
+	void ScanLaunchLog();
+	static std::string GetDocumentsPath();
+	static std::string GetLaunchLogPath();
+	static void ParseLaunchLogLine(
+		const std::string& line,
+		std::string& outServerName,
+		std::string& outGameUrl);
 
 	// Utilities
 	static std::string Trim(const std::string& s);

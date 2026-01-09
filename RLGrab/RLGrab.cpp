@@ -4,19 +4,15 @@
 #include "imgui/imgui.h"
 
 #include <Windows.h>
-#include <iphlpapi.h>
-#include <tlhelp32.h>
+#include <shlobj_core.h>
 
-#include <winsock2.h>
-#include <ws2tcpip.h>
-
+#include <fstream>
 #include <sstream>
 #include <set>
 #include <chrono>
+#include <regex>
 
-#pragma comment(lib, "iphlpapi.lib")
-#pragma comment(lib, "ws2_32.lib")
-
+#pragma comment(lib, "shell32.lib")
 
 std::shared_ptr<CVarManagerWrapper> _globalCvarManager;
 
@@ -45,148 +41,175 @@ bool RLGrab::Contains(const std::vector<std::string>& v, const std::string& valu
 	return false;
 }
 
-static std::string IPv4ToString(DWORD addr)
-{
-	BYTE b1 = (addr) & 0xFF;
-	BYTE b2 = (addr >> 8) & 0xFF;
-	BYTE b3 = (addr >> 16) & 0xFF;
-	BYTE b4 = (addr >> 24) & 0xFF;
-
-	std::ostringstream ss;
-	ss << (int)b1 << "." << (int)b2 << "." << (int)b3 << "." << (int)b4;
-	return ss.str();
-}
-
-static uint16_t PortFromNetworkOrder(DWORD dwPort)
-{
-	uint16_t portNet = static_cast<uint16_t>(dwPort);
-	return ntohs(portNet);
-}
-
 std::string RLGrab::ExtractIpOnly(const std::string& endpoint)
 {
-	// endpoint is "ip:port"
-	auto pos = endpoint.find(':');
-	if (pos == std::string::npos)
+	// endpoint is "ip:port" OR "ServerName (ip:port)"
+	// Try to find the last '(' and ')' and extract "ip:port" if present.
+	auto openParen = endpoint.find_last_of('(');
+	auto closeParen = endpoint.find_last_of(')');
+	if (openParen != std::string::npos && closeParen != std::string::npos && closeParen > openParen + 1)
+	{
+		std::string inner = endpoint.substr(openParen + 1, closeParen - openParen - 1);
+		auto colon = inner.find(':');
+		if (colon != std::string::npos)
+			return inner.substr(0, colon);
+		return inner;
+	}
+
+	// Fallback: treat whole string as "ip:port" and strip port
+	auto colon = endpoint.find(':');
+	if (colon == std::string::npos)
 		return endpoint;
-	return endpoint.substr(0, pos);
+	return endpoint.substr(0, colon);
 }
 
-// ----------------- Process enumeration -----------------
+// ----------------- Log file helpers -----------------
 
-unsigned long RLGrab::FindRocketLeaguePid()
+std::string RLGrab::GetDocumentsPath()
 {
-	unsigned long pid = 0;
-
-	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (snapshot == INVALID_HANDLE_VALUE)
-		return 0;
-
-	PROCESSENTRY32 pe;
-	pe.dwSize = sizeof(PROCESSENTRY32);
-
-	if (Process32First(snapshot, &pe))
+	wchar_t path[MAX_PATH] = { 0 };
+	if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, path)))
 	{
-		do
+		std::wstring wpath(path);
+		return std::string(wpath.begin(), wpath.end());
+	}
+	return "";
+}
+
+std::string RLGrab::GetLaunchLogPath()
+{
+	// Documents\My Games\Rocket League\TAGame\Logs\Launch.log
+	std::string docs = GetDocumentsPath();
+	if (docs.empty())
+		return "";
+
+	std::ostringstream oss;
+	oss << docs << "\\My Games\\Rocket League\\TAGame\\Logs\\Launch.log";
+	return oss.str();
+}
+
+void RLGrab::ParseLaunchLogLine(
+	const std::string& line,
+	std::string& outServerName,
+	std::string& outGameUrl)
+{
+	// Look for ServerName="..."
+	// and GameURL="..."
+	static const std::regex serverNameRegex(R"(ServerName="([^"]*)\")");
+		static const std::regex gameUrlRegex(R"(GameURL="([^"]*)\")");
+
+		std::smatch m;
+	if (std::regex_search(line, m, serverNameRegex) && m.size() > 1)
+	{
+		outServerName = m[1].str();
+	}
+	if (std::regex_search(line, m, gameUrlRegex) && m.size() > 1)
+	{
+		outGameUrl = m[1].str();
+	}
+}
+
+void RLGrab::ScanLaunchLog()
+{
+	std::string path = GetLaunchLogPath();
+	if (path.empty())
+	{
+		return;
+	}
+
+	std::ifstream file(path, std::ios::in);
+	if (!file.is_open())
+	{
+		return;
+	}
+
+	// We will parse from the beginning each time.
+	// To avoid duplicates, we keep a set of endpoints we have seen in this plugin instance.
+	std::vector<std::string> newEndpoints;
+	std::set<std::string> seenEndpoints;
+
+	{
+		std::lock_guard<std::mutex> lock(ipsMutex);
+		seenEndpoints.insert(knownEndpoints.begin(), knownEndpoints.end());
+	}
+
+	std::string line;
+	std::string currentServerName;
+	std::string currentGameUrl;
+
+	while (std::getline(file, line))
+	{
+		std::string serverName;
+		std::string gameUrl;
+		ParseLaunchLogLine(line, serverName, gameUrl);
+
+		if (!serverName.empty())
+			currentServerName = serverName;
+		if (!gameUrl.empty())
+			currentGameUrl = gameUrl;
+
+		// When we have a GameURL, we can log an endpoint.
+		if (!currentGameUrl.empty())
 		{
-			std::wstring exe(pe.szExeFile);
-			std::wstring target = L"RocketLeague.exe";
-
-			if (_wcsicmp(exe.c_str(), target.c_str()) == 0)
+			// GameURL expected like "ip:port" or maybe with additional query params; keep it raw.
+			std::string endpointLabel;
+			if (!currentServerName.empty())
 			{
-				pid = pe.th32ProcessID;
-				break;
+				// Format: ServerName (ip:port)
+				std::ostringstream ss;
+				ss << currentServerName << " (" << currentGameUrl << ")";
+				endpointLabel = ss.str();
 			}
-		} while (Process32Next(snapshot, &pe));
+			else
+			{
+				endpointLabel = currentGameUrl;
+			}
+
+			// Avoid pure duplicates if logDuplicates == false.
+			bool alreadySeen = (seenEndpoints.find(endpointLabel) != seenEndpoints.end());
+
+			if (logDuplicates || !alreadySeen)
+			{
+				newEndpoints.push_back(endpointLabel);
+				seenEndpoints.insert(endpointLabel);
+			}
+
+			// Reset currentGameUrl so a single line doesn't repeatedly add.
+			currentGameUrl.clear();
+		}
 	}
 
-	CloseHandle(snapshot);
-	return pid;
-}
+	if (newEndpoints.empty())
+		return;
 
-// ----------------- TCP enumeration -----------------
-
-bool RLGrab::GetAllTcpConnections(std::vector<ConnectionInfo>& outConnections)
-{
-	outConnections.clear();
-
-	ULONG size = 0;
-	DWORD ret = GetExtendedTcpTable(
-		nullptr,
-		&size,
-		TRUE,
-		AF_INET,
-		TCP_TABLE_OWNER_PID_ALL,
-		0);
-
-	if (ret != ERROR_INSUFFICIENT_BUFFER)
+	// Store with newest on top.
 	{
-		return false;
+		std::lock_guard<std::mutex> lock(ipsMutex);
+		for (const auto& ep : newEndpoints)
+		{
+			// Insert at the beginning so newest appear first.
+			knownEndpoints.insert(knownEndpoints.begin(), ep);
+		}
+
+		// Adjust selection to the first/newest if nothing selected yet.
+		if (selectedIndex < 0 && !knownEndpoints.empty())
+		{
+			selectedIndex = 0;
+		}
 	}
-
-	auto buf = std::make_unique<char[]>(size);
-	PMIB_TCPTABLE_OWNER_PID table = reinterpret_cast<PMIB_TCPTABLE_OWNER_PID>(buf.get());
-
-	ret = GetExtendedTcpTable(
-		table,
-		&size,
-		TRUE,
-		AF_INET,
-		TCP_TABLE_OWNER_PID_ALL,
-		0);
-
-	if (ret != NO_ERROR)
-	{
-		return false;
-	}
-
-	for (DWORD i = 0; i < table->dwNumEntries; ++i)
-	{
-		const MIB_TCPROW_OWNER_PID& row = table->table[i];
-
-		ConnectionInfo info;
-		info.localAddress = IPv4ToString(row.dwLocalAddr);
-		info.localPort = PortFromNetworkOrder(row.dwLocalPort);
-		info.remoteAddress = IPv4ToString(row.dwRemoteAddr);
-		info.remotePort = PortFromNetworkOrder(row.dwRemotePort);
-		info.pid = row.dwOwningPid;
-
-		outConnections.push_back(info);
-	}
-
-	return true;
-}
-
-std::vector<RLGrab::ConnectionInfo> RLGrab::FilterByPid(const std::vector<ConnectionInfo>& all, unsigned long pid)
-{
-	std::vector<ConnectionInfo> filtered;
-	for (const auto& c : all)
-	{
-		if (c.pid == pid)
-			filtered.push_back(c);
-	}
-	return filtered;
 }
 
 // ----------------- BakkesMod lifecycle -----------------
 
 void RLGrab::onLoad()
 {
-	// Winsock init
-	WSADATA wsaData;
-	int wsaErr = WSAStartup(MAKEWORD(2, 2), &wsaData);
-	if (wsaErr != 0)
-	{
-		cvarManager->log("RLGrab: WSAStartup failed with error " + std::to_string(wsaErr));
-	}
-
 	// Defaults
-	pollIntervalMs = 1500;
+	pollIntervalMs = 3000; // check every few seconds
 	logDuplicates = false;
 
 	running = true;
-	inMatch = false;
-	ipScanDone = false;
+	inMatch = false;   // no longer used for network state, but kept for compatibility
+	ipScanDone = false; // no longer used to stop scanning, always scanning
 
 	RegisterCVars();
 	RegisterNotifiers();
@@ -194,10 +217,13 @@ void RLGrab::onLoad()
 
 	_globalCvarManager = cvarManager;
 
-	// Worker thread
+	// Initial scan on load
+	ScanLaunchLog();
+
+	// Worker thread: periodically re-read Launch.log
 	workerThread = std::thread([this]() { WorkerLoop(); });
 
-	cvarManager->log("RLGrab loaded.");
+	cvarManager->log("RLGrab loaded (log watcher).");
 }
 
 void RLGrab::onUnload()
@@ -207,8 +233,6 @@ void RLGrab::onUnload()
 
 	if (workerThread.joinable())
 		workerThread.join();
-
-	WSACleanup();
 
 	cvarManager->log("RLGrab unloaded.");
 }
@@ -221,7 +245,7 @@ void RLGrab::SetImGuiContext(uintptr_t ctx)
 
 void RLGrab::RenderSettings()
 {
-	ImGui::TextUnformatted("RL server IPs seen this match:");
+	ImGui::TextUnformatted("RL server IPs seen from Launch.log:");
 	ImGui::Separator();
 	RenderIpListUI();
 
@@ -229,7 +253,7 @@ void RLGrab::RenderSettings()
 
 	// Basic options
 	int poll = pollIntervalMs;
-	if (ImGui::SliderInt("Poll interval (ms)", &poll, 250, 5000))
+	if (ImGui::SliderInt("Poll interval (ms)", &poll, 1000, 10000))
 	{
 		pollIntervalMs = poll;
 		auto c = cvarManager->getCvar("rlgrab_poll_interval_ms");
@@ -255,11 +279,11 @@ void RLGrab::RenderIpListUI()
 
 	if (knownEndpoints.empty())
 	{
-		ImGui::TextUnformatted("No endpoints found yet. Start a match and wait a few seconds.");
+		ImGui::TextUnformatted("No endpoints found yet. Play a match so Launch.log contains server info.");
 		return;
 	}
 
-	// Build list of labels (ip:port)
+	// Build list of labels (newest first)
 	std::vector<const char*> items;
 	items.reserve(knownEndpoints.size());
 	for (const auto& ep : knownEndpoints)
@@ -284,49 +308,77 @@ void RLGrab::RenderIpListUI()
 
 void RLGrab::CopySelectedIpToClipboard()
 {
-	std::lock_guard<std::mutex> lock(ipsMutex);
+	std::string ipOnly;
+	{
+		std::lock_guard<std::mutex> lock(ipsMutex);
 
-	if (knownEndpoints.empty() || selectedIndex < 0 || selectedIndex >= (int)knownEndpoints.size())
+		if (knownEndpoints.empty() || selectedIndex < 0 || selectedIndex >= (int)knownEndpoints.size())
+			return;
+
+		std::string endpoint = knownEndpoints[selectedIndex];
+		ipOnly = ExtractIpOnly(endpoint);
+	}
+
+	if (ipOnly.empty())
 		return;
 
-	std::string endpoint = knownEndpoints[selectedIndex];
-	std::string ipOnly = ExtractIpOnly(endpoint);
+	// Convert to wide string
+	std::wstring wstr(ipOnly.begin(), ipOnly.end());
+	const SIZE_T byteSize = (wstr.size() + 1) * sizeof(wchar_t);
 
-	if (OpenClipboard(nullptr))
+	// Allocate global memory that the clipboard will own
+	HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, byteSize);
+	if (!hMem)
+		return;
+
+	void* pData = GlobalLock(hMem);
+	if (!pData)
 	{
-		EmptyClipboard();
-
-		const size_t size = (ipOnly.size() + 1) * sizeof(wchar_t);
-		HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
-		if (hMem)
-		{
-			wchar_t* dst = (wchar_t*)GlobalLock(hMem);
-			if (dst)
-			{
-				std::wstring wstr(ipOnly.begin(), ipOnly.end());
-				wcscpy_s(dst, wstr.size() + 1, wstr.c_str());
-				GlobalUnlock(hMem);
-				SetClipboardData(CF_UNICODETEXT, hMem);
-			}
-			else
-			{
-				GlobalFree(hMem);
-			}
-		}
-
-		CloseClipboard();
+		GlobalFree(hMem);
+		return;
 	}
+
+	memcpy(pData, wstr.c_str(), byteSize);
+	GlobalUnlock(hMem);
+
+	// Optional: use the game window handle if available; otherwise nullptr
+	HWND hwndOwner = nullptr;
+
+	if (!OpenClipboard(hwndOwner))
+	{
+		GlobalFree(hMem);
+		return;
+	}
+
+	if (!EmptyClipboard())
+	{
+		CloseClipboard();
+		GlobalFree(hMem);
+		return;
+	}
+
+	if (!SetClipboardData(CF_UNICODETEXT, hMem))
+	{
+		// On failure, we must free the memory because the system does not take ownership.
+		GlobalFree(hMem);
+		CloseClipboard();
+		return;
+	}
+
+	// Success: the system now owns hMem; do NOT free it.
+	CloseClipboard();
 }
+
 
 // ----------------- CVars / Hooks / Match state -----------------
 
 void RLGrab::RegisterCVars()
 {
-	cvarManager->registerCvar("rlgrab_poll_interval_ms", std::to_string(pollIntervalMs), "Poll interval in milliseconds")
+	cvarManager->registerCvar("rlgrab_poll_interval_ms", std::to_string(pollIntervalMs), "Poll interval in milliseconds for Launch.log scan")
 		.addOnValueChanged([this](std::string, CVarWrapper cvar)
 			{
 				int v = cvar.getIntValue();
-				if (v < 250) v = 250;
+				if (v < 1000) v = 1000;
 				pollIntervalMs = v;
 			});
 
@@ -339,42 +391,51 @@ void RLGrab::RegisterCVars()
 
 void RLGrab::RegisterNotifiers()
 {
-	// Optional: manual reset
+	// Manual reset
 	cvarManager->registerNotifier("rlgrab_reset",
 		[this](std::vector<std::string>) {
 			std::lock_guard<std::mutex> lock(ipsMutex);
 			knownEndpoints.clear();
 			selectedIndex = -1;
-			ipScanDone = false;
 		},
 		"Reset RLGrab IP list for current session", PERMISSION_ALL);
+
+	// Optional: force rescan of Launch.log
+	cvarManager->registerNotifier("rlgrab_rescan_log",
+		[this](std::vector<std::string>) {
+			ScanLaunchLog();
+		},
+		"Force immediate rescan of Launch.log", PERMISSION_ALL);
 }
 
 void RLGrab::RegisterHooks()
 {
+	// Hooks kept minimal; log-based approach does not require match events,
+	// but we can still clear on new games if desired.
+
 	gameWrapper->HookEvent("Function TAGame.GameEvent_Soccar_TA.PostBeginPlay",
-		[this](std::string eventName) { OnMatchStarted(eventName); });
+		[this](std::string) {
+			std::lock_guard<std::mutex> lock(ipsMutex);
+			// Optionally: clear on new match
+			// knownEndpoints.clear();
+			// selectedIndex = -1;
+		});
 
 	gameWrapper->HookEvent("Function TAGame.GameEvent_Soccar_TA.EventMatchEnded",
-		[this](std::string eventName) { OnMatchEnded(eventName); });
-
-	// You can add additional hooks here for other modes if needed.
+		[this](std::string) {
+			// No special handling needed; Launch.log scanning continues.
+		});
 }
 
 void RLGrab::OnMatchStarted(std::string)
 {
+	// Not used in log-based approach, kept for compatibility.
 	inMatch = true;
-	ipScanDone = false;
-
-	std::lock_guard<std::mutex> lock(ipsMutex);
-	knownEndpoints.clear();
-	selectedIndex = -1;
 }
 
 void RLGrab::OnMatchEnded(std::string)
 {
 	inMatch = false;
-	ipScanDone = true; // no more scanning this match
 }
 
 // ----------------- Worker loop -----------------
@@ -383,63 +444,7 @@ void RLGrab::WorkerLoop()
 {
 	while (running)
 	{
-		if (inMatch && !ipScanDone)
-		{
-			QueryAndStoreIPs();
-		}
-
+		ScanLaunchLog();
 		std::this_thread::sleep_for(std::chrono::milliseconds(pollIntervalMs));
-	}
-}
-
-// ----------------- IP collection -----------------
-
-void RLGrab::QueryAndStoreIPs()
-{
-	unsigned long rlPid = FindRocketLeaguePid();
-	if (rlPid == 0)
-	{
-		return;
-	}
-
-	std::vector<ConnectionInfo> all;
-	if (!GetAllTcpConnections(all))
-	{
-		return;
-	}
-
-	auto rlConns = FilterByPid(all, rlPid);
-	if (rlConns.empty())
-		return;
-
-	std::lock_guard<std::mutex> lock(ipsMutex);
-
-	std::set<std::string> sessionEndpoints(knownEndpoints.begin(), knownEndpoints.end());
-	bool newEndpoint = false;
-
-	for (const auto& c : rlConns)
-	{
-		if (c.remoteAddress == "0.0.0.0")
-			continue;
-
-		std::ostringstream ss;
-		ss << c.remoteAddress << ":" << c.remotePort;
-		std::string endpoint = ss.str();
-
-		if (!logDuplicates && sessionEndpoints.count(endpoint))
-			continue;
-
-		if (!sessionEndpoints.count(endpoint))
-		{
-			sessionEndpoints.insert(endpoint);
-			knownEndpoints.push_back(endpoint);
-			newEndpoint = true;
-		}
-	}
-
-	// If we found at least one endpoint, we can stop scanning for this match.
-	if (newEndpoint && !knownEndpoints.empty())
-	{
-		ipScanDone = true;
 	}
 }
